@@ -4,12 +4,11 @@ import numpy as np
 import torch
 import logging
 import torch.nn.functional as F
-from typing import List
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 from pathlib import Path
 from model.fnet import FNet
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from sam2.build_sam import build_sam2
@@ -29,6 +28,7 @@ print(f"using device: {device}")
 def setup_logger(log_file: str) -> logging.Logger:
     logger = logging.getLogger("Evaluation")
     logger.setLevel(logging.INFO)
+    logger.propagate = False
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -186,11 +186,12 @@ def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
     return x_min, y_min, x_max, y_max
 
 
-def combine_masks(masks: List[np.ndarray]) -> np.ndarray:
+def combine_masks(masks: np.ndarray) -> np.ndarray:
     """
     Given a list of binary masks for the same image,
     return their pixel-wise OR (union) as one mask.
     """
+    assert masks.ndim == 3
     combined = np.zeros_like(masks[0], dtype=bool)
     for m in masks:
         combined |= m.astype(bool)
@@ -315,9 +316,13 @@ def sam2_inference(image_np, boxes=None):
         box=boxes_np,
         multimask_output=False,
     )
-    pred_mask = combine_masks(masks.squeeze(1).astype(np.uint8))
-
-    return pred_mask
+    masks = masks > 0.5
+    if masks.ndim == 3:
+        assert masks.shape[0] == 1
+        return combine_masks(masks)
+    else:
+        assert masks.shape[1] == 1
+        return combine_masks(masks.squeeze(1))
 
 
 if __name__ == '__main__':
@@ -348,9 +353,11 @@ if __name__ == '__main__':
                 continue
 
             pil_image = Image.open(image_path).convert("RGB")
+            # Apply rotation to JPEGs with EXIF orientation
+            pil_image = ImageOps.exif_transpose(pil_image)
             # shape: (H, W, 3); dtype: uint8
             image_np = np.array(pil_image)
-            W, H = pil_image.size
+            H, W, _ = image_np.shape
 
             pil_mask = Image.open(mask_path).convert("L")
             # shape: (H, W), dtype: uint8
@@ -378,8 +385,8 @@ if __name__ == '__main__':
 
 
             # fnet_inference(img_path, ckpt_path)
-            pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
-            # pred_mask = sam2_inference(image_np, new_boxes)
+            # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
+            pred_mask = sam2_inference(image_np, new_boxes)
             ''''''
             if pred_mask.dtype != bool:
                 pred_mask = pred_mask > 0.5
@@ -400,11 +407,11 @@ if __name__ == '__main__':
             )
 
             # fig, axs = plt.subplots(1, 2)
-            # axs[0].imshow(mask_np, cmap="gray", vmin=0, vmax=255)
+            # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
             # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
             # plt.show()
 
-        #     break
+            # break
         # break
 
     mean_iou = total_iou / total_images
