@@ -296,7 +296,10 @@ def medsam_inference(pil_image, boxes, image_size):
         low_res_pred = low_res_pred.squeeze().cpu().numpy()
         pred_masks = low_res_pred > 0.5
 
-    return combine_masks(pred_masks)
+    if pred_masks.ndim == 2:
+        return pred_masks
+    else:
+        return combine_masks(pred_masks)
 
 
 def sam2_inference(image_np, boxes=None):
