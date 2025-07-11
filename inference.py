@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -10,13 +11,12 @@ from torch import nn
 from tqdm import tqdm
 from pathlib import Path
 from fnet import FNet
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from segment_anything import sam_model_registry
-
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -26,12 +26,19 @@ else:
     device = torch.device("cpu")
 print(f"using device: {device}")
 
+data_dir = Path.cwd().parents[0] / "Data"
+test_dir = data_dir / "test"
+image_dir = test_dir / "img"
+mask_dir = test_dir / "mask"
+neg_dir = test_dir / "neg"
+log_dir = Path.cwd().parents[0] / "Results" / "eval"
+
 
 def setup_logger(log_file: str) -> logging.Logger:
     logger = logging.getLogger("Evaluation")
     logger.setLevel(logging.INFO)
     logger.propagate = False
-    fh = logging.FileHandler(log_file)
+    fh = logging.FileHandler(log_file, mode="w")
     fh.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     fh.setFormatter(fmt)
@@ -40,8 +47,8 @@ def setup_logger(log_file: str) -> logging.Logger:
 
 
 def compute_iou(pred_mask: np.ndarray,
-        true_mask: np.ndarray,
-        eps: float = 1e-6) -> float:
+                true_mask: np.ndarray,
+                eps: float = 1e-6) -> float:
     """
     Compute IoU for two binary masks.
 
@@ -66,8 +73,8 @@ def compute_iou(pred_mask: np.ndarray,
 
 
 def compute_dsc(pred_mask: np.ndarray,
-         true_mask: np.ndarray,
-         eps: float = 1e-6) -> float:
+                true_mask: np.ndarray,
+                eps: float = 1e-6) -> float:
     """
     Compute Dice Similarity Coefficient (DSC) for two binary masks.
 
@@ -93,8 +100,8 @@ def compute_dsc(pred_mask: np.ndarray,
 
 
 def compute_sens(pred_mask: np.ndarray,
-         true_mask: np.ndarray,
-         eps: float = 1e-6) -> float:
+                 true_mask: np.ndarray,
+                 eps: float = 1e-6) -> float:
     """
     Compute Sensitivity (Recall, TPR) for two binary masks.
 
@@ -112,8 +119,8 @@ def compute_sens(pred_mask: np.ndarray,
 
 
 def compute_spec(pred_mask: np.ndarray,
-         true_mask: np.ndarray,
-         eps: float = 1e-6) -> float:
+                 true_mask: np.ndarray,
+                 eps: float = 1e-6) -> float:
     """
     Compute Specificity (TNR) for two binary masks.
 
@@ -130,18 +137,21 @@ def compute_spec(pred_mask: np.ndarray,
     return tn / (tn + fp + eps)
 
 
-def mask_to_boxes(mask, min_area=100):
+def mask_to_boxes(mask: np.ndarray, min_area: int = 0):
+    H, W = mask.shape[:2]
     _, bw = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     boxes = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        boxes.append((x, y, x + w, y + h))
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(x + w, W)
+        y2 = min(y + h, H)
 
-        # area = w * h
-        # if area >= min_area:
-        #     boxes.append((x, y, w, h))
+        if (x2 - x1) * (y2 - y1) >= min_area:
+            boxes.append((x1, y1, x2, y2))
 
     return boxes
 
@@ -184,8 +194,51 @@ def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
     y_min = np.clip(y_min, 0, H_img)
     y_max = np.clip(y_max, 0, H_img)
 
-
     return x_min, y_min, x_max, y_max
+
+
+def sample_negative_points(
+        mask: np.ndarray,
+        boxes: list[tuple[int, int, int, int]],
+        num_neg_points: int = 4,
+        min_dist_frac: float = 0.1
+) -> list[list[tuple[int, int]]]:
+    """
+    For each bounding box in `boxes`, sample up to `num_neg_points` negative points
+    inside the box but outside the true-mask area. Reject corners too close to the
+    mask contour, then fall back on deepest background pixels.
+
+    Args:
+      mask:           2D uint8 array, 0=background, >0=foreground.
+      boxes:          list of (x_min, y_min, x_max, y_max) tuples.
+      num_neg_points: how many negatives per box (default 4).
+      min_dist_frac:  minimum safe distance (as fraction of smaller box side)
+                      for a corner to count.
+
+    Returns:
+      A list of lists; each sub-list is the negative-point coords for the
+      corresponding box in `boxes`.
+    """
+    # Precompute global distance‐transform of background→foreground
+    inv = (mask == 0).astype(np.uint8) * 255
+    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+
+    all_negs = []
+    for (x0, y0, x1, y1) in boxes:
+        w, h = x1 - x0, y1 - y0
+        threshold = min(w, h) * min_dist_frac
+
+        # test only the four corners
+        corners = [(x0, y0), (x0, y1), (x1, y0), (x1, y1)]
+        negs = [
+            (x, y) for (x, y) in corners
+            if dist[y, x] >= threshold
+        ]
+
+        # cap to the requested number
+        all_negs.append(negs[:num_neg_points])
+
+    return all_negs
 
 
 def combine_masks(masks: np.ndarray) -> np.ndarray:
@@ -209,17 +262,33 @@ def show_mask_gray(mask, ax):
     ax.axis("off")
 
 
-def show_box(box, ax):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(
-        plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
-    )
-
-
 def show_boxes(boxes, ax):
     for box in boxes:
-        show_box(box, ax)
+        x0, y0 = box[0], box[1]
+        w, h = box[2] - box[0], box[3] - box[1]
+        ax.add_patch(
+            plt.Rectangle((x0, y0), w, h, edgecolor="blue", facecolor=(0, 0, 0, 0), lw=2)
+        )
+
+
+def show_points(
+        points: list[tuple[int, int]],
+        ax: plt.Axes,
+        color: str = "red",
+        size: int = 50,
+        marker: str = "o"
+):
+    if not points:
+        return
+
+    xs, ys = zip(*points)
+    ax.scatter(
+        xs, ys,
+        c=color,
+        s=size,
+        marker=marker,
+        zorder=3
+    )
 
 
 def fnet_inference(pil_image, image_size):
@@ -252,7 +321,6 @@ def fnet_inference(pil_image, image_size):
         # pred_seg = predict.data.cpu().numpy() * 255
 
     return pred > 0.5
-
 
 
 def medsam_inference(pil_image, boxes, image_size):
@@ -310,30 +378,57 @@ def medsam_inference(pil_image, boxes, image_size):
         return combine_masks(pred_masks)
 
 
-def sam2_inference(image_np, boxes=None):
-    boxes_np = np.array(boxes)
-
+def sam2_inference(
+        image_np: np.ndarray,
+        pos_points: list[list[tuple[int, int]]] = None,
+        neg_points: list[list[tuple[int, int]]] = None,
+        boxes: list[tuple[int, int, int, int]] = None
+) -> Optional[np.ndarray]:
     sam2_checkpoint = "ckpt/sam2.1_hiera_base_plus.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
-
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
-
     predictor = SAM2ImagePredictor(sam2_model)
     predictor.set_image(image_np)
 
-    masks, scores, _ = predictor.predict(
-        point_coords=None,
-        point_labels=None,
-        box=boxes_np,
-        multimask_output=False,
-    )
-    masks = masks > 0.5
-    if masks.ndim == 3:
-        assert masks.shape[0] == 1
-        return combine_masks(masks)
-    else:
-        assert masks.shape[1] == 1
-        return combine_masks(masks.squeeze(1))
+    tasks = []
+
+    if pos_points:
+        masks = []
+        for pts  in pos_points:
+            coords = np.array(pts)
+            labels = np.ones(len(pts), dtype=int)
+            tasks.append((coords, labels, None))
+
+    if boxes:
+        if neg_points and len(neg_points) != len(boxes):
+            raise ValueError("neg_points length must equal boxes length")
+        for idx, box in enumerate(boxes):
+            bg = neg_points[idx] if neg_points else []
+            coords = np.array(bg) if bg else None
+            labels = np.zeros(len(bg), dtype=int) if bg else None
+            tasks.append((coords, labels, np.array(box)))
+
+    if not tasks:
+        logger.error("sam2_inference: must provide pos_points or boxes")
+        return None
+
+    mask_list = []
+    for point_coords, point_labels, box_coords in tasks:
+        mask, _, _ = predictor.predict(
+            point_coords=point_coords,
+            point_labels=point_labels,
+            box=box_coords,
+            multimask_output=False,
+            return_logits=False,
+        )
+        # mask.shape = (1, H, W)
+        mask_list.append(mask[0])
+
+    if len(mask_list) == 1:
+        return mask_list[0] > 0.5
+
+    masks = np.stack(mask_list, axis=0) > 0.5
+    return combine_masks(masks)
 
 
 def evaluate():
@@ -343,106 +438,115 @@ def evaluate():
     total_spec = 0.0
     total_images = 0
 
-    data_dir = Path.cwd().parents[0] / "Data"
-    test_dir = data_dir / "test"
-    image_dir = test_dir / "img"
-    mask_dir = test_dir / "mask"
-
     for folder_name in ["f1", "f2", "f3", "f4", "f5"]:
         image_subfolder = image_dir / folder_name
         mask_subfolder = mask_dir / folder_name
 
         image_paths = list(image_subfolder.iterdir())
-        for image_path in tqdm(image_paths, desc=f"Images in {folder_name}", unit="img"):
-            img_name = image_path.stem
-            mask_path = mask_dir / folder_name / f"{img_name}.png"
-            if not mask_path.is_file():
-                logger.error(f"Mask not found: {mask_path}")
-                continue
+        with tqdm(image_paths, unit="img") as pbar:
+            for image_path in pbar:
+                image_name = image_path.stem
+                pbar.set_description(f"Processing {image_name} in {folder_name}")
+                mask_path = mask_dir / folder_name / f"{image_name}.png"
+                if not mask_path.is_file():
+                    logger.error(f"Mask not found: {mask_path}")
+                    continue
 
-            pil_image = Image.open(image_path).convert("RGB")
-            # Apply rotation to JPEGs with EXIF orientation
-            pil_image = ImageOps.exif_transpose(pil_image)
-            # shape: (H, W, 3); dtype: uint8
-            image_np = np.array(pil_image)
-            H, W, _ = image_np.shape
+                pil_image = Image.open(image_path).convert("RGB")
+                # Apply rotation to JPEGs with EXIF orientation
+                pil_image = ImageOps.exif_transpose(pil_image)
+                # shape: (H, W, 3); dtype: uint8
+                image_np = np.array(pil_image)
+                H, W, _ = image_np.shape
 
-            pil_mask = Image.open(mask_path).convert("L")
-            # shape: (H, W), dtype: uint8
-            mask_np = np.array(pil_mask)
-            # dtype: bool
-            true_mask = mask_np > 127
+                pil_mask = Image.open(mask_path).convert("L")
+                # shape: (H, W), dtype: uint8
+                mask_np = np.array(pil_mask)
+                # dtype: bool
+                true_mask = mask_np > 127
 
-            # print(mask_np.dtype)
-            # print(mask_np.min(), mask_np.max())
-            # unique_vals = np.unique(mask_np)
-            # unique_set = set(unique_vals.tolist())
-            # print(unique_set)
+                # print(mask_np.dtype)
+                # print(mask_np.min(), mask_np.max())
+                # unique_vals = np.unique(mask_np)
+                # unique_set = set(unique_vals.tolist())
+                # print(unique_set)
 
-            # Each box: [x_min,y_min,x_max,y_max]
-            boxes = mask_to_boxes(mask_np)
-            new_boxes = []
-            for box in boxes:
-                new_box = jitter_box(box, (W, H))
-                new_boxes.append(new_box)
+                # Each box: [x_min,y_min,x_max,y_max]
+                boxes = mask_to_boxes(mask_np)
+                # new_boxes = []
+                # for box in boxes:
+                #     new_box = jitter_box(box, (W, H))
+                #     new_boxes.append(new_box)
 
-            # fig, ax = plt.subplots(1)
-            # ax.imshow(image_np)
-            # show_boxes(new_boxes, ax)
-            # plt.show()
+                # shape: (num_contours,  num_points, 2); dtype: int
+                # pos_points = mask_to_points_contour(mask_np)
+                neg_points = sample_negative_points(mask_np, boxes)
 
-            pred_mask = fnet_inference(pil_image, (H, W))
-            # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
-            # pred_mask = sam2_inference(image_np, new_boxes)
-            ''''''
-            if pred_mask.dtype != bool:
-                pred_mask = pred_mask > 0.5
+                # Show prompts on mask
+                # mask_vis = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
+                # mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_BGR2RGB)
+                # fig, ax = plt.subplots(1, figsize=(8, 6))
+                # ax.imshow(mask_vis)
+                # show_boxes(boxes, ax)
+                # show_points(neg_points, ax)
+                # plt.axis("off")
+                # plt.show()
 
-            total_images += 1
-            dsc = compute_dsc(pred_mask, true_mask)
-            iou = compute_iou(pred_mask, true_mask)
-            sens = compute_sens(pred_mask, true_mask)
-            spec = compute_spec(pred_mask, true_mask)
+                # pred_mask = fnet_inference(pil_image, (H, W))
+                # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
+                # pred_mask = sam2_inference(image_np, boxes=boxes)
+                pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
+                ''''''
+                if pred_mask.dtype != bool:
+                    pred_mask = pred_mask > 0.5
 
-            total_dsc += dsc
-            total_iou += iou
-            total_sens += sens
-            total_spec += spec
+                total_images += 1
+                dsc = compute_dsc(pred_mask, true_mask)
+                iou = compute_iou(pred_mask, true_mask)
+                sens = compute_sens(pred_mask, true_mask)
+                spec = compute_spec(pred_mask, true_mask)
 
-            logger.info(
-                f"Image {folder_name}-{img_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
-            )
+                print(f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}")
 
-            # fig, axs = plt.subplots(1, 2)
-            # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
-            # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
-            # plt.show()
+                # total_dsc += dsc
+                # total_iou += iou
+                # total_sens += sens
+                # total_spec += spec
+                #
+                # logger.info(
+                #     f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+                # )
 
+                # fig, axs = plt.subplots(1, 2, figsize=(8, 6))
+                # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
+                # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
+                # axs[0].axis('off')
+                # axs[1].axis('off')
+                # plt.show()
+
+                break
             break
-        break
 
-    mean_iou = total_iou / total_images
-    mean_dsc = total_dsc / total_images
-    mean_sens = total_sens / total_images
-    mean_spec = total_spec / total_images
-
-    print(f"Mean IoU: {mean_iou:.4f}")
-    print(f"Mean DSC: {mean_dsc:.4f}")
-    print(f"Mean Sensitivity: {mean_sens:.4f}")
-    print(f"Mean Specificity: {mean_spec:.4f}")
-
-    logger.info(
-        f"\n=== Summary over {total_images} images ===\n"
-        f"Mean IoU  : {mean_iou:.4f}\n"
-        f"Mean Dice : {mean_dsc:.4f}\n"
-        f"Mean Sens : {mean_sens:.4f}\n"
-        f"Mean Spec : {mean_spec:.4f}"
-    )
+    # mean_iou = total_iou / total_images
+    # mean_dsc = total_dsc / total_images
+    # mean_sens = total_sens / total_images
+    # mean_spec = total_spec / total_images
+    #
+    # print(f"Mean IoU: {mean_iou:.4f}")
+    # print(f"Mean DSC: {mean_dsc:.4f}")
+    # print(f"Mean Sensitivity: {mean_sens:.4f}")
+    # print(f"Mean Specificity: {mean_spec:.4f}")
+    #
+    # logger.info(
+    #     f"\n=== Summary over {total_images} images ===\n"
+    #     f"Mean IoU  : {mean_iou:.4f}\n"
+    #     f"Mean Dice : {mean_dsc:.4f}\n"
+    #     f"Mean Sens : {mean_sens:.4f}\n"
+    #     f"Mean Spec : {mean_spec:.4f}"
+    # )
 
 
 def collect_metrics(log_prefix):
-    log_dir = Path.cwd().parents[0] / "Results" / "eval"
-
     pat_iou = re.compile(r"^Mean\s+IoU\s*:\s*(?P<iou>\d+\.\d+)", re.MULTILINE)
     pat_dice = re.compile(r"^Mean\s+Dice\s*:\s*(?P<dice>\d+\.\d+)", re.MULTILINE)
     pat_sens = re.compile(r"^Mean\s+Sens\s*:\s*(?P<sens>\d+\.\d+)", re.MULTILINE)
@@ -489,6 +593,64 @@ def collect_metrics(log_prefix):
     }
 
 
+def collect_negatives(log_file):
+    log_path = log_dir / log_file
+
+    pattern = re.compile(r"Image\s+([^-:]+-[^-:]+):\s+IoU=([0-9]*\.?[0-9]+)")
+
+    with open(log_path, 'r') as f:
+        for line in f:
+            m = pattern.search(line)
+            if not m:
+                continue
+
+            name, iou = m.groups()
+            iou = float(iou)
+            if iou < 0.85:
+                print(name, iou)
+                folder_name, image_name = name.split("-")
+                image_path = image_dir / folder_name / f"{image_name}.jpg"
+                mask_path = mask_dir / folder_name / f"{image_name}.png"
+
+                true_mask = Image.open(mask_path).convert("L")
+                # shape: (H, W), dtype: uint8
+                mask_np = np.array(true_mask)
+                boxes = mask_to_boxes(mask_np)
+
+                pil_image = Image.open(image_path).convert("RGB")
+                # Apply rotation to JPEGs with EXIF orientation
+                pil_image = ImageOps.exif_transpose(pil_image)
+                # shape: (H, W, 3); dtype: uint8
+                image_np = np.array(pil_image)
+                H, W, _ = image_np.shape
+
+                fnet_mask = fnet_inference(pil_image, (H, W))
+                fnet_mask = (fnet_mask.astype(np.uint8)) * 255
+                fnet_mask = Image.fromarray(fnet_mask, mode="L")
+
+                sam2_mask = sam2_inference(image_np, boxes)
+                sam2_mask = (sam2_mask.astype(np.uint8)) * 255
+                sam2_mask = Image.fromarray(sam2_mask, mode="L")
+
+                draw = ImageDraw.Draw(pil_image)
+                for (x1, y1, x2, y2) in boxes:
+                    draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
+
+                neg_dir.mkdir(parents=True, exist_ok=True)
+                pil_image.save(neg_dir / f"{name}_box.jpg")
+                sam2_mask.save(neg_dir / f"{name}_sam2.png")
+                fnet_mask.save(neg_dir / f"{name}_fnet.png")
+                true_mask.save(neg_dir / f"{name}_true.png")
+
+                # plt.figure(figsize=(8, 6))
+                # plt.imshow(pil_image)
+                # plt.imshow(sam2_mask, cmap="gray", vmin=0, vmax=255)
+                # plt.axis('off')
+                # plt.show()
+
+                break
+
+
 if __name__ == '__main__':
     # print(os.getcwd())
     logger = setup_logger("eval.log")
@@ -496,7 +658,4 @@ if __name__ == '__main__':
     # results = collect_metrics("medsam")
     # for name, (mu, sd) in results.items():
     #     print(f"{name:4s}: {mu:6.2f} ± {sd:5.2f} %")
-
-
-
-
+    # collect_negatives("sam2_cpu-1.log")
