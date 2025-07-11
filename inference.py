@@ -1,13 +1,15 @@
-import os
+import re
+
 import cv2
 import numpy as np
 import torch
 import logging
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
+from torch import nn
 from tqdm import tqdm
 from pathlib import Path
-from model.fnet import FNet
+from fnet import FNet
 from PIL import Image, ImageOps
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -220,15 +222,16 @@ def show_boxes(boxes, ax):
         show_box(box, ax)
 
 
-def fnet_inference(img_path, ckpt_path):
+def fnet_inference(pil_image, image_size):
+    ckpt_path = "ckpt/model_099_0.9588.pth.tar"
     model = FNet()
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model = nn.DataParallel(model)
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    # print(ckpt["state_dict"].keys())
     model.load_state_dict(ckpt["state_dict"])
+    ''''''
     model = model.to(device)
     model.eval()
-
-    # RGB
-    img = Image.open(img_path)
 
     transform = transforms.Compose([
         transforms.Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
@@ -236,15 +239,20 @@ def fnet_inference(img_path, ckpt_path):
     ])
 
     # (1, C, 512, 512)
-    img_tensor = transform(img).unsqueeze(0)
+    img_tensor = transform(pil_image).unsqueeze(0)
 
+    H, W = image_size
     with torch.no_grad():
         out_logits, _ = model(img_tensor)
-        print(out_logits.shape)
+        pred = torch.sigmoid(out_logits)
+        pred = F.interpolate(pred, size=(H, W), mode="area")
+        pred = pred.squeeze().cpu().numpy()
+        # print(pred.shape, pred.dtype)
         # predict = torch.round(torch.sigmoid(main_out)).byte()
         # pred_seg = predict.data.cpu().numpy() * 255
 
-    # result = Image.fromarray(pred_seg.squeeze(), mode='L')
+    return pred > 0.5
+
 
 
 def medsam_inference(pil_image, boxes, image_size):
@@ -328,10 +336,7 @@ def sam2_inference(image_np, boxes=None):
         return combine_masks(masks.squeeze(1))
 
 
-if __name__ == '__main__':
-    # print(os.getcwd())
-    logger = setup_logger("eval.log")
-
+def evaluate():
     total_iou = 0.0
     total_dsc = 0.0
     total_sens = 0.0
@@ -386,10 +391,9 @@ if __name__ == '__main__':
             # show_boxes(new_boxes, ax)
             # plt.show()
 
-
-            # fnet_inference(img_path, ckpt_path)
+            pred_mask = fnet_inference(pil_image, (H, W))
             # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
-            pred_mask = sam2_inference(image_np, new_boxes)
+            # pred_mask = sam2_inference(image_np, new_boxes)
             ''''''
             if pred_mask.dtype != bool:
                 pred_mask = pred_mask > 0.5
@@ -414,8 +418,8 @@ if __name__ == '__main__':
             # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
             # plt.show()
 
-            # break
-        # break
+            break
+        break
 
     mean_iou = total_iou / total_images
     mean_dsc = total_dsc / total_images
@@ -434,5 +438,65 @@ if __name__ == '__main__':
         f"Mean Sens : {mean_sens:.4f}\n"
         f"Mean Spec : {mean_spec:.4f}"
     )
+
+
+def collect_metrics(log_prefix):
+    log_dir = Path.cwd().parents[0] / "Results" / "eval"
+
+    pat_iou = re.compile(r"^Mean\s+IoU\s*:\s*(?P<iou>\d+\.\d+)", re.MULTILINE)
+    pat_dice = re.compile(r"^Mean\s+Dice\s*:\s*(?P<dice>\d+\.\d+)", re.MULTILINE)
+    pat_sens = re.compile(r"^Mean\s+Sens\s*:\s*(?P<sens>\d+\.\d+)", re.MULTILINE)
+    pat_spec = re.compile(r"^Mean\s+Spec\s*:\s*(?P<spec>\d+\.\d+)", re.MULTILINE)
+
+    ious, dices, senss, specs = [], [], [], []
+
+    for log_path in log_dir.iterdir():
+        if not (
+                log_path.is_file()
+                and log_path.name.startswith(log_prefix)
+                and log_path.name.endswith(".log")
+        ):
+            continue
+
+        text = log_path.read_text()
+
+        # Extract summary values
+        m_iou = pat_iou.search(text)
+        m_dice = pat_dice.search(text)
+        m_sens = pat_sens.search(text)
+        m_spec = pat_spec.search(text)
+
+        if not (m_iou and m_dice and m_sens and m_spec):
+            raise ValueError(f"Could not find summary metrics in {log_path.name}")
+
+        # Convert to float and scale to percent
+        ious.append(float(m_iou.group("iou")) * 100)
+        dices.append(float(m_dice.group("dice")) * 100)
+        senss.append(float(m_sens.group("sens")) * 100)
+        specs.append(float(m_spec.group("spec")) * 100)
+
+    # print(len(ious), len(dices), len(senss), len(specs))
+
+    def mean_std(vals):
+        arr = np.array(vals, dtype=float)
+        return float(arr.mean()), float(arr.std(ddof=1))
+
+    return {
+        "IoU": mean_std(ious),
+        "Dice": mean_std(dices),
+        "Sens": mean_std(senss),
+        "Spec": mean_std(specs),
+    }
+
+
+if __name__ == '__main__':
+    # print(os.getcwd())
+    logger = setup_logger("eval.log")
+    evaluate()
+    # results = collect_metrics("medsam")
+    # for name, (mu, sd) in results.items():
+    #     print(f"{name:4s}: {mu:6.2f} ± {sd:5.2f} %")
+
+
 
 

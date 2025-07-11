@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchvision import models
+from torchvision.models import resnet34, ResNet34_Weights
 import torch.nn.functional as F
 from functools import partial
 from torch.nn import init
@@ -183,7 +183,12 @@ class FNet(nn.Module):
         self.conv = nn.Conv2d(3, 3, 1)  # in_channel,out_channel,kernel  1*1卷积、
         # self.conv1 = nn.Conv2d(6, 8, 1)
         # self.conv2 = nn.Conv2d(8, 3, 1)
-        resnet = models.resnet34(pretrained=True)  # 预训练模型
+        # resnet = resnet34(weights=ResNet34_Weights.DEFAULT)
+        resnet_ckpt = "ckpt/resnet34-b627a593.pth"
+        resnet = resnet34(weights=None)
+        ckpt = torch.load(resnet_ckpt, map_location="cpu")
+        resnet.load_state_dict(ckpt)
+        # 预训练模型
         self.firstconv = resnet.conv1  # self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.firstbn = resnet.bn1
         self.firstrelu = resnet.relu
