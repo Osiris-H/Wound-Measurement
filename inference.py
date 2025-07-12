@@ -137,7 +137,27 @@ def compute_spec(pred_mask: np.ndarray,
     return tn / (tn + fp + eps)
 
 
-def mask_to_boxes(mask: np.ndarray, min_area: int = 0):
+def mask_to_boxes(
+        mask: np.ndarray,
+        min_area: int = 0,
+        pad_frac: float = 0.05,
+        pad_mode: Optional[str] = None
+) -> list[tuple[int, int, int, int]]:
+    """
+    Extracts bounding boxes around external contours in `mask`, then enlarges
+    each box by a padding fraction.
+
+    Args:
+      mask:      2D or 3D uint8 array (H×W), foreground >127.
+      min_area:  minimum area (in pixels) to keep a box.
+      pad_frac:  fraction by which to enlarge each box.
+      pad_mode:  "box" → pad relative to the box’s own width/height;
+                 "image" → pad relative to the full image’s width/height.
+
+    Returns:
+      List of (x1, y1, x2, y2) tuples, with padding applied and
+      clamped to image boundaries.
+    """
     H, W = mask.shape[:2]
     _, bw = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
     contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -145,13 +165,25 @@ def mask_to_boxes(mask: np.ndarray, min_area: int = 0):
     boxes = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
-        x1 = max(0, x)
-        y1 = max(0, y)
-        x2 = min(x + w, W)
-        y2 = min(y + h, H)
+        area = w * h
+        if area < min_area:
+            continue
 
-        if (x2 - x1) * (y2 - y1) >= min_area:
-            boxes.append((x1, y1, x2, y2))
+        if pad_mode == "box":
+            pad_w = int(round(pad_frac * w))
+            pad_h = int(round(pad_frac * h))
+        elif pad_mode == "image":
+            pad_w = int(round(pad_frac * W))
+            pad_h = int(round(pad_frac * H))
+        else:
+            raise ValueError("pad_mode must be 'box' or 'image'")
+
+        x1 = max(0, x - pad_w)
+        y1 = max(0, y - pad_h)
+        x2 = min(W, x + w + pad_w)
+        y2 = min(H, y + h + pad_h)
+
+        boxes.append((x1, y1, x2, y2))
 
     return boxes
 
@@ -470,7 +502,7 @@ def sam2_inference(
     tasks = []
 
     if pos_points:
-        for pts  in pos_points:
+        for pts in pos_points:
             coords = np.array(pts)
             labels = np.ones(len(pts), dtype=int)
             tasks.append((coords, labels, None))
@@ -548,10 +580,10 @@ def evaluate():
                 # print(unique_set)
 
                 # Each box: [x_min,y_min,x_max,y_max]
-                boxes = mask_to_boxes(mask_np)
+                boxes = mask_to_boxes(mask_np, pad_mode="box")
                 # shape: (num_contours,  num_points, 2); dtype: int
-                pos_points = mask_to_points_center(mask_np)
-                neg_points = sample_negative_points(mask_np, boxes)
+                # pos_points = mask_to_points_center(mask_np)
+                # neg_points = sample_negative_points(mask_np, boxes)
 
                 '''
                 # Show prompts on mask
@@ -559,8 +591,8 @@ def evaluate():
                 mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_BGR2RGB)
                 fig, ax = plt.subplots(1, figsize=(8, 6))
                 ax.imshow(mask_vis)
-                # show_boxes(boxes, ax)
-                show_points(pos_points, ax)
+                show_boxes(boxes, ax)
+                # show_points(pos_points, ax)
                 # show_points(neg_points, ax)
                 plt.axis("off")
                 plt.show()
@@ -568,8 +600,8 @@ def evaluate():
 
                 # pred_mask = fnet_inference(pil_image, (H, W))
                 # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
-                # pred_mask = sam2_inference(image_np, boxes=boxes)
-                pred_mask = sam2_inference(image_np, pos_points=pos_points)
+                pred_mask = sam2_inference(image_np, boxes=boxes)
+                # pred_mask = sam2_inference(image_np, pos_points=pos_points)
                 # pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
                 ''''''
                 if pred_mask.dtype != bool:
@@ -599,8 +631,8 @@ def evaluate():
                 # axs[1].axis('off')
                 # plt.show()
 
-            #     break
-            # break
+                break
+            break
 
     mean_iou = total_iou / total_images
     mean_dsc = total_dsc / total_images
