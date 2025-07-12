@@ -176,7 +176,7 @@ def mask_to_boxes(
             pad_w = int(round(pad_frac * W))
             pad_h = int(round(pad_frac * H))
         else:
-            raise ValueError("pad_mode must be 'box' or 'image'")
+            pad_w = pad_h = 0
 
         x1 = max(0, x - pad_w)
         y1 = max(0, y - pad_h)
@@ -494,7 +494,9 @@ def sam2_inference(
         boxes: list[tuple[int, int, int, int]] = None
 ) -> Optional[np.ndarray]:
     sam2_checkpoint = "ckpt/sam2.1_hiera_base_plus.pt"
+    # sam2_checkpoint = "ckpt/sam2.1_hiera_large.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    # model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
     predictor = SAM2ImagePredictor(sam2_model)
     predictor.set_image(image_np)
@@ -508,13 +510,33 @@ def sam2_inference(
             tasks.append((coords, labels, None))
 
     if boxes:
+        if pos_points and len(pos_points) != len(boxes):
+            logger.error("pos_points length must equal boxes length")
+            return None
         if neg_points and len(neg_points) != len(boxes):
-            raise ValueError("neg_points length must equal boxes length")
+            logger.error("neg_points length must equal boxes length")
+            return None
         for idx, box in enumerate(boxes):
-            bg = neg_points[idx] if neg_points else []
-            coords = np.array(bg) if bg else None
-            labels = np.zeros(len(bg), dtype=int) if bg else None
-            tasks.append((coords, labels, np.array(box)))
+            pos_pt = pos_points[idx] if pos_points else []
+            neg_pt = neg_points[idx] if neg_points else []
+
+            coord_chunks = []
+            label_chunks = []
+
+            if pos_pt:
+                coord_chunks.append(np.array(pos_pt))
+                label_chunks.append(np.ones(len(pos_pt), dtype=int))
+            if neg_pt:
+                coord_chunks.append(np.array(neg_pt))
+                label_chunks.append(np.zeros(len(neg_pt), dtype=int))
+
+            if coord_chunks:
+                coords = np.concatenate(coord_chunks, axis=0)
+                labels = np.concatenate(label_chunks, axis=0)
+            else:
+                coords = None
+                labels = None
+                tasks.append((coords, labels, np.array(box)))
 
     if not tasks:
         logger.error("sam2_inference: must provide pos_points or boxes")
@@ -555,7 +577,7 @@ def evaluate():
             for image_path in pbar:
                 image_name = image_path.stem
                 pbar.set_description(f"Processing {image_name} in {folder_name}")
-                mask_path = mask_dir / folder_name / f"{image_name}.png"
+                mask_path = mask_subfolder / f"{image_name}.png"
                 if not mask_path.is_file():
                     logger.error(f"Mask not found: {mask_path}")
                     continue
@@ -573,16 +595,11 @@ def evaluate():
                 # dtype: bool
                 true_mask = mask_np > 127
 
-                # print(mask_np.dtype)
-                # print(mask_np.min(), mask_np.max())
-                # unique_vals = np.unique(mask_np)
-                # unique_set = set(unique_vals.tolist())
-                # print(unique_set)
-
                 # Each box: [x_min,y_min,x_max,y_max]
-                boxes = mask_to_boxes(mask_np, pad_mode="box")
+                boxes = mask_to_boxes(mask_np)
+                # boxes = mask_to_boxes(mask_np, pad_mode="box")
                 # shape: (num_contours,  num_points, 2); dtype: int
-                # pos_points = mask_to_points_center(mask_np)
+                pos_points = mask_to_points_center(mask_np)
                 # neg_points = sample_negative_points(mask_np, boxes)
 
                 '''
@@ -592,7 +609,7 @@ def evaluate():
                 fig, ax = plt.subplots(1, figsize=(8, 6))
                 ax.imshow(mask_vis)
                 show_boxes(boxes, ax)
-                # show_points(pos_points, ax)
+                show_points(pos_points, ax)
                 # show_points(neg_points, ax)
                 plt.axis("off")
                 plt.show()
@@ -602,6 +619,7 @@ def evaluate():
                 # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
                 pred_mask = sam2_inference(image_np, boxes=boxes)
                 # pred_mask = sam2_inference(image_np, pos_points=pos_points)
+                # pred_mask = sam2_inference(image_np, boxes=boxes, pos_points=pos_points)
                 # pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
                 ''''''
                 if pred_mask.dtype != bool:
@@ -624,12 +642,12 @@ def evaluate():
                     f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
                 )
 
-                # fig, axs = plt.subplots(1, 2, figsize=(8, 6))
-                # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
-                # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
-                # axs[0].axis('off')
-                # axs[1].axis('off')
-                # plt.show()
+                fig, axs = plt.subplots(1, 2, figsize=(8, 6))
+                axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
+                axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
+                axs[0].axis('off')
+                axs[1].axis('off')
+                plt.show()
 
                 break
             break
