@@ -20,8 +20,8 @@ from segment_anything import sam_model_registry
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
+# elif torch.backends.mps.is_available():
+#     device = torch.device("mps")
 else:
     device = torch.device("cpu")
 print(f"using device: {device}")
@@ -197,6 +197,59 @@ def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
     return x_min, y_min, x_max, y_max
 
 
+def mask_to_points_center(
+        mask: np.ndarray,
+        num_points: int = 1,
+        jitter_factor: float = 0.0
+) -> list[list[tuple[int, int]]]:
+    """
+    For each connected foreground region in `mask`, compute the pixel
+    at the center of the largest inscribed circle (the max-distance
+    point in a distance-transform), then optionally jitter around it.
+    Returns a list of length num_regions; each entry is a list of
+    `num_points` (x, y) tuples for that region.
+    """
+    # --- 1) Binarize & label connected components ---
+    _, bw = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+    num_labels, labels = cv2.connectedComponents(bw)
+
+    results: list[list[tuple[int, int]]] = []
+
+    # Skip label 0 (background)
+    for lbl in range(1, num_labels):
+        # build binary mask for this single component
+        comp_mask = (labels == lbl).astype(np.uint8) * 255
+
+        # --- 2) distance transform on that component mask ---
+        dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
+
+        # find the “deepest” (max-distance) pixel
+        flat_idx = np.argmax(dist)
+        y0, x0 = np.unravel_index(flat_idx, dist.shape)
+        r_max = dist[y0, x0]
+
+        # --- 3) sample center + jitter inside that maximal circle ---
+        pts_for_region: list[tuple[int, int]] = []
+        for _ in range(num_points):
+            if jitter_factor > 0 and r_max > 0:
+                # sample radius so that (x0+dx, y0+dy) always stays within r_max
+                jitter_r = jitter_factor * r_max
+                # uniform in disk: radius ~ sqrt(U)*jitter_r
+                r = np.sqrt(np.random.uniform(0, 1)) * jitter_r
+                theta = np.random.uniform(0, 2 * np.pi)
+                dx = int(r * np.cos(theta))
+                dy = int(r * np.sin(theta))
+                xi, yi = x0 + dx, y0 + dy
+            else:
+                xi, yi = x0, y0
+
+            pts_for_region.append((xi, yi))
+
+        results.append(pts_for_region)
+
+    return results
+
+
 def sample_negative_points(
         mask: np.ndarray,
         boxes: list[tuple[int, int, int, int]],
@@ -222,22 +275,30 @@ def sample_negative_points(
     # Precompute global distance‐transform of background→foreground
     inv = (mask == 0).astype(np.uint8) * 255
     dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+    H, W = dist.shape
 
     all_negs = []
     for (x0, y0, x1, y1) in boxes:
         w, h = x1 - x0, y1 - y0
         threshold = min(w, h) * min_dist_frac
 
-        # test only the four corners
-        corners = [(x0, y0), (x0, y1), (x1, y0), (x1, y1)]
-        negs = [
-            (x, y) for (x, y) in corners
-            if dist[y, x] >= threshold
+        # Use x1-1, y1-1 so we don't step out of bounds
+        corners = [
+            (x0, y0),
+            (x0, y1 - 1),
+            (x1 - 1, y0),
+            (x1 - 1, y1 - 1),
         ]
 
-        # cap to the requested number
-        all_negs.append(negs[:num_neg_points])
+        # Filter out-of-bounds and those too close to the mask
+        negs = []
+        for x, y in corners:
+            if 0 <= x < W and 0 <= y < H and dist[y, x] >= threshold:
+                negs.append((x, y))
+            if len(negs) == num_neg_points:
+                break
 
+        all_negs.append(negs)
     return all_negs
 
 
@@ -272,16 +333,32 @@ def show_boxes(boxes, ax):
 
 
 def show_points(
-        points: list[tuple[int, int]],
+        points: list[list[tuple[int, int]]],
         ax: plt.Axes,
         color: str = "red",
         size: int = 50,
         marker: str = "o"
 ):
+    """
+    Scatter all (x,y) points in a nested list `points` onto `ax`.
+    `points` can be either:
+      - a flat list of (x,y) tuples, or
+      - a list of lists of (x,y) tuples.
+    """
+    # Normalize to a flat list of tuples
     if not points:
         return
 
-    xs, ys = zip(*points)
+    # If the first element is itself a tuple, assume flat; else flatten
+    if isinstance(points[0], tuple):
+        flat_pts = points  # type: ignore
+    else:
+        flat_pts = [pt for sublist in points for pt in sublist]
+
+    if not flat_pts:
+        return
+
+    xs, ys = zip(*flat_pts)
     ax.scatter(
         xs, ys,
         c=color,
@@ -393,7 +470,6 @@ def sam2_inference(
     tasks = []
 
     if pos_points:
-        masks = []
         for pts  in pos_points:
             coords = np.array(pts)
             labels = np.ones(len(pts), dtype=int)
@@ -473,29 +549,28 @@ def evaluate():
 
                 # Each box: [x_min,y_min,x_max,y_max]
                 boxes = mask_to_boxes(mask_np)
-                # new_boxes = []
-                # for box in boxes:
-                #     new_box = jitter_box(box, (W, H))
-                #     new_boxes.append(new_box)
-
                 # shape: (num_contours,  num_points, 2); dtype: int
-                # pos_points = mask_to_points_contour(mask_np)
+                pos_points = mask_to_points_center(mask_np)
                 neg_points = sample_negative_points(mask_np, boxes)
 
+                '''
                 # Show prompts on mask
-                # mask_vis = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
-                # mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_BGR2RGB)
-                # fig, ax = plt.subplots(1, figsize=(8, 6))
-                # ax.imshow(mask_vis)
+                mask_vis = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
+                mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_BGR2RGB)
+                fig, ax = plt.subplots(1, figsize=(8, 6))
+                ax.imshow(mask_vis)
                 # show_boxes(boxes, ax)
+                show_points(pos_points, ax)
                 # show_points(neg_points, ax)
-                # plt.axis("off")
-                # plt.show()
+                plt.axis("off")
+                plt.show()
+                '''
 
                 # pred_mask = fnet_inference(pil_image, (H, W))
                 # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
                 # pred_mask = sam2_inference(image_np, boxes=boxes)
-                pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
+                pred_mask = sam2_inference(image_np, pos_points=pos_points)
+                # pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
                 ''''''
                 if pred_mask.dtype != bool:
                     pred_mask = pred_mask > 0.5
@@ -506,16 +581,16 @@ def evaluate():
                 sens = compute_sens(pred_mask, true_mask)
                 spec = compute_spec(pred_mask, true_mask)
 
-                print(f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}")
+                # print(f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}")
 
-                # total_dsc += dsc
-                # total_iou += iou
-                # total_sens += sens
-                # total_spec += spec
-                #
-                # logger.info(
-                #     f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
-                # )
+                total_dsc += dsc
+                total_iou += iou
+                total_sens += sens
+                total_spec += spec
+
+                logger.info(
+                    f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+                )
 
                 # fig, axs = plt.subplots(1, 2, figsize=(8, 6))
                 # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
@@ -524,26 +599,26 @@ def evaluate():
                 # axs[1].axis('off')
                 # plt.show()
 
-                break
-            break
+            #     break
+            # break
 
-    # mean_iou = total_iou / total_images
-    # mean_dsc = total_dsc / total_images
-    # mean_sens = total_sens / total_images
-    # mean_spec = total_spec / total_images
-    #
-    # print(f"Mean IoU: {mean_iou:.4f}")
-    # print(f"Mean DSC: {mean_dsc:.4f}")
-    # print(f"Mean Sensitivity: {mean_sens:.4f}")
-    # print(f"Mean Specificity: {mean_spec:.4f}")
-    #
-    # logger.info(
-    #     f"\n=== Summary over {total_images} images ===\n"
-    #     f"Mean IoU  : {mean_iou:.4f}\n"
-    #     f"Mean Dice : {mean_dsc:.4f}\n"
-    #     f"Mean Sens : {mean_sens:.4f}\n"
-    #     f"Mean Spec : {mean_spec:.4f}"
-    # )
+    mean_iou = total_iou / total_images
+    mean_dsc = total_dsc / total_images
+    mean_sens = total_sens / total_images
+    mean_spec = total_spec / total_images
+
+    print(f"Mean IoU: {mean_iou:.4f}")
+    print(f"Mean DSC: {mean_dsc:.4f}")
+    print(f"Mean Sensitivity: {mean_sens:.4f}")
+    print(f"Mean Specificity: {mean_spec:.4f}")
+
+    logger.info(
+        f"\n=== Summary over {total_images} images ===\n"
+        f"Mean IoU  : {mean_iou:.4f}\n"
+        f"Mean Dice : {mean_dsc:.4f}\n"
+        f"Mean Sens : {mean_sens:.4f}\n"
+        f"Mean Spec : {mean_spec:.4f}"
+    )
 
 
 def collect_metrics(log_prefix):
@@ -606,7 +681,7 @@ def collect_negatives(log_file):
 
             name, iou = m.groups()
             iou = float(iou)
-            if iou < 0.85:
+            if iou < 0.8:
                 print(name, iou)
                 folder_name, image_name = name.split("-")
                 image_path = image_dir / folder_name / f"{image_name}.jpg"
@@ -616,6 +691,7 @@ def collect_negatives(log_file):
                 # shape: (H, W), dtype: uint8
                 mask_np = np.array(true_mask)
                 boxes = mask_to_boxes(mask_np)
+                neg_points = sample_negative_points(mask_np, boxes)
 
                 pil_image = Image.open(image_path).convert("RGB")
                 # Apply rotation to JPEGs with EXIF orientation
@@ -628,13 +704,22 @@ def collect_negatives(log_file):
                 fnet_mask = (fnet_mask.astype(np.uint8)) * 255
                 fnet_mask = Image.fromarray(fnet_mask, mode="L")
 
-                sam2_mask = sam2_inference(image_np, boxes)
+                sam2_mask = sam2_inference(image_np, boxes=boxes)
                 sam2_mask = (sam2_mask.astype(np.uint8)) * 255
                 sam2_mask = Image.fromarray(sam2_mask, mode="L")
 
                 draw = ImageDraw.Draw(pil_image)
                 for (x1, y1, x2, y2) in boxes:
                     draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
+
+                for pts in neg_points:
+                    for (x, y) in pts:
+                        # small red circle of radius 3px
+                        r = 3
+                        draw.ellipse(
+                            [(x - r, y - r), (x + r, y + r)],
+                            fill="red"
+                        )
 
                 neg_dir.mkdir(parents=True, exist_ok=True)
                 pil_image.save(neg_dir / f"{name}_box.jpg")
@@ -658,4 +743,4 @@ if __name__ == '__main__':
     # results = collect_metrics("medsam")
     # for name, (mu, sd) in results.items():
     #     print(f"{name:4s}: {mu:6.2f} ± {sd:5.2f} %")
-    # collect_negatives("sam2_cpu-1.log")
+    # collect_negatives("sam2_neg-pt_box.log")

@@ -1,6 +1,3 @@
-
-
-
 def mask_to_points_contour(
         mask: np.ndarray,
         num_points: int = 8
@@ -42,9 +39,11 @@ def mask_to_points_contour(
     return sampled_pts
 
 
-def mask_to_points_center(mask: np.ndarray,
-                          num_points: int = 1,
-                          jitter_factor: float = 0.0) -> list[tuple[int, int]]:
+def mask_to_points_center(
+        mask: np.ndarray,
+        num_points: int = 1,
+        jitter_factor: float = 0.0
+) -> list[tuple[int, int]]:
     """
     For each external contour in `mask`, compute the pixel
     at the maximum distance from the contour boundary (i.e.
