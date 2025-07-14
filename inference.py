@@ -1,6 +1,7 @@
 import re
 from typing import Optional
 
+import PIL
 import cv2
 import numpy as np
 import torch
@@ -11,7 +12,7 @@ from torch import nn
 from tqdm import tqdm
 from pathlib import Path
 from fnet import FNet
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageOps, ImageDraw, ImageFile
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from sam2.build_sam import build_sam2
@@ -44,6 +45,25 @@ def setup_logger(log_file: str) -> logging.Logger:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     return logger
+
+
+def load_fnet():
+    ckpt_path = "ckpt/model_099_0.9588.pth.tar"
+    model = FNet()
+    model = nn.DataParallel(model)
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    # print(ckpt["state_dict"].keys())
+    model.load_state_dict(ckpt["state_dict"])
+
+    return model
+
+
+def load_sam2(device="cpu"):
+    sam2_checkpoint = "ckpt/sam2.1_hiera_base_plus.pt"
+    model_cfg = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+    sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
+
+    return sam2_model
 
 
 def compute_iou(pred_mask: np.ndarray,
@@ -229,111 +249,6 @@ def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
     return x_min, y_min, x_max, y_max
 
 
-def mask_to_points_center(
-        mask: np.ndarray,
-        num_points: int = 1,
-        jitter_factor: float = 0.0
-) -> list[list[tuple[int, int]]]:
-    """
-    For each connected foreground region in `mask`, compute the pixel
-    at the center of the largest inscribed circle (the max-distance
-    point in a distance-transform), then optionally jitter around it.
-    Returns a list of length num_regions; each entry is a list of
-    `num_points` (x, y) tuples for that region.
-    """
-    # --- 1) Binarize & label connected components ---
-    _, bw = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    num_labels, labels = cv2.connectedComponents(bw)
-
-    results: list[list[tuple[int, int]]] = []
-
-    # Skip label 0 (background)
-    for lbl in range(1, num_labels):
-        # build binary mask for this single component
-        comp_mask = (labels == lbl).astype(np.uint8) * 255
-
-        # --- 2) distance transform on that component mask ---
-        dist = cv2.distanceTransform(comp_mask, cv2.DIST_L2, 5)
-
-        # find the “deepest” (max-distance) pixel
-        flat_idx = np.argmax(dist)
-        y0, x0 = np.unravel_index(flat_idx, dist.shape)
-        r_max = dist[y0, x0]
-
-        # --- 3) sample center + jitter inside that maximal circle ---
-        pts_for_region: list[tuple[int, int]] = []
-        for _ in range(num_points):
-            if jitter_factor > 0 and r_max > 0:
-                # sample radius so that (x0+dx, y0+dy) always stays within r_max
-                jitter_r = jitter_factor * r_max
-                # uniform in disk: radius ~ sqrt(U)*jitter_r
-                r = np.sqrt(np.random.uniform(0, 1)) * jitter_r
-                theta = np.random.uniform(0, 2 * np.pi)
-                dx = int(r * np.cos(theta))
-                dy = int(r * np.sin(theta))
-                xi, yi = x0 + dx, y0 + dy
-            else:
-                xi, yi = x0, y0
-
-            pts_for_region.append((xi, yi))
-
-        results.append(pts_for_region)
-
-    return results
-
-
-def sample_negative_points(
-        mask: np.ndarray,
-        boxes: list[tuple[int, int, int, int]],
-        num_neg_points: int = 4,
-        min_dist_frac: float = 0.1
-) -> list[list[tuple[int, int]]]:
-    """
-    For each bounding box in `boxes`, sample up to `num_neg_points` negative points
-    inside the box but outside the true-mask area. Reject corners too close to the
-    mask contour, then fall back on deepest background pixels.
-
-    Args:
-      mask:           2D uint8 array, 0=background, >0=foreground.
-      boxes:          list of (x_min, y_min, x_max, y_max) tuples.
-      num_neg_points: how many negatives per box (default 4).
-      min_dist_frac:  minimum safe distance (as fraction of smaller box side)
-                      for a corner to count.
-
-    Returns:
-      A list of lists; each sub-list is the negative-point coords for the
-      corresponding box in `boxes`.
-    """
-    # Precompute global distance‐transform of background→foreground
-    inv = (mask == 0).astype(np.uint8) * 255
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
-    H, W = dist.shape
-
-    all_negs = []
-    for (x0, y0, x1, y1) in boxes:
-        w, h = x1 - x0, y1 - y0
-        threshold = min(w, h) * min_dist_frac
-
-        # Use x1-1, y1-1 so we don't step out of bounds
-        corners = [
-            (x0, y0),
-            (x0, y1 - 1),
-            (x1 - 1, y0),
-            (x1 - 1, y1 - 1),
-        ]
-
-        # Filter out-of-bounds and those too close to the mask
-        negs = []
-        for x, y in corners:
-            if 0 <= x < W and 0 <= y < H and dist[y, x] >= threshold:
-                negs.append((x, y))
-            if len(negs) == num_neg_points:
-                break
-
-        all_negs.append(negs)
-    return all_negs
-
-
 def combine_masks(masks: np.ndarray) -> np.ndarray:
     """
     Given a list of binary masks for the same image,
@@ -400,7 +315,7 @@ def show_points(
     )
 
 
-def fnet_inference(pil_image, image_size):
+def fnet_inference(pil_image):
     ckpt_path = "ckpt/model_099_0.9588.pth.tar"
     model = FNet()
     model = nn.DataParallel(model)
@@ -419,7 +334,7 @@ def fnet_inference(pil_image, image_size):
     # (1, C, 512, 512)
     img_tensor = transform(pil_image).unsqueeze(0)
 
-    H, W = image_size
+    W, H = pil_image.size
     with torch.no_grad():
         out_logits, _ = model(img_tensor)
         pred = torch.sigmoid(out_logits)
@@ -432,63 +347,8 @@ def fnet_inference(pil_image, image_size):
     return pred > 0.5
 
 
-def medsam_inference(pil_image, boxes, image_size):
-    ckpt_path = "ckpt/medsam_vit_b.pth"
-    medsam_model = sam_model_registry["vit_b"](checkpoint=ckpt_path)
-    medsam_model = medsam_model.to(device)
-    medsam_model.eval()
-
-    preprocess = transforms.Compose([
-        transforms.Resize((1024, 1024), InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-    ])
-
-    # (3, H, W)
-    image_tensor = preprocess(pil_image).to(device)
-    # (B=1, 3, H, W)
-    image_tensor = image_tensor.unsqueeze(0)
-
-    H, W = image_size
-    with torch.no_grad():
-        image_embed = medsam_model.image_encoder(image_tensor)
-
-        boxes_np = np.array(boxes)
-        boxes_np = boxes_np / np.array([W, H, W, H]) * 1024
-        boxes_tensor = torch.tensor(boxes_np, dtype=torch.float32, device=device)
-
-        sparse_embeddings, dense_embeddings = medsam_model.prompt_encoder(
-            points=None,
-            boxes=boxes_tensor,
-            masks=None,
-        )
-        low_res_logits, _ = medsam_model.mask_decoder(
-            image_embeddings=image_embed,  # (B, 256, 64, 64)
-            image_pe=medsam_model.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
-            sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
-            dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
-            multimask_output=False,
-        )
-
-        low_res_pred = torch.sigmoid(low_res_logits)  # (1, 1, 256, 256)
-
-        low_res_pred = F.interpolate(
-            low_res_pred,
-            size=(H, W),
-            mode="bilinear",
-            align_corners=False,
-        )  # (1, 1, gt.shape)
-        # (num_masks, H, W)
-        low_res_pred = low_res_pred.squeeze().cpu().numpy()
-        pred_masks = low_res_pred > 0.5
-
-    if pred_masks.ndim == 2:
-        return pred_masks
-    else:
-        return combine_masks(pred_masks)
-
-
 def sam2_inference(
-        image_np: np.ndarray,
+        pil_image: Image.Image,
         pos_points: list[list[tuple[int, int]]] = None,
         neg_points: list[list[tuple[int, int]]] = None,
         boxes: list[tuple[int, int, int, int]] = None
@@ -499,6 +359,8 @@ def sam2_inference(
     # model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
     predictor = SAM2ImagePredictor(sam2_model)
+
+    image_np = np.array(pil_image)
     predictor.set_image(image_np)
 
     tasks = []
@@ -561,6 +423,56 @@ def sam2_inference(
     return combine_masks(masks)
 
 
+def sam2_from_fnet(
+        pil_image: Image.Image,
+        boxes: list[tuple[int, int, int, int]]
+) -> np.ndarray:
+    fnet_model = load_fnet().to(device)
+    fnet_model.eval()
+    transform = transforms.Compose([
+        transforms.Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
+        transforms.ToTensor(),  # → FloatTensor in [0,1], shape C×H×W
+    ])
+
+    # (1, C, 512, 512)
+    img_tensor = transform(pil_image).unsqueeze(0)
+    with torch.no_grad():
+        out_logits, _ = fnet_model(img_tensor)
+        low_res = F.interpolate(
+            out_logits,
+            size=(256, 256),
+            mode='bilinear',
+            align_corners=True
+        )
+        # Required by sam2
+        low_res = torch.clamp(low_res, -32.0, 32.0)
+        low_res_masks = low_res.cpu().numpy()
+
+    image_np = np.array(pil_image)
+    sam2_model = load_sam2()
+    predictor = SAM2ImagePredictor(sam2_model)
+    predictor.set_image(image_np)
+
+    box_coords = np.array(boxes)
+    masks, _, _ = predictor.predict(
+        point_coords=None,
+        point_labels=None,
+        box=box_coords,
+        mask_input=low_res_masks,
+        multimask_output=False,
+        return_logits=False,
+    )
+
+    if masks.ndim == 3:
+        # single mask: (1, H, W)
+        final_mask = masks[0] > 0.5
+    else:
+        # multi-mask: combine into one
+        final_mask = combine_masks(masks.squeeze(1) > 0.5)
+
+    return final_mask
+
+
 def evaluate():
     total_iou = 0.0
     total_dsc = 0.0
@@ -584,10 +496,11 @@ def evaluate():
 
                 pil_image = Image.open(image_path).convert("RGB")
                 # Apply rotation to JPEGs with EXIF orientation
+                # (W, H)
                 pil_image = ImageOps.exif_transpose(pil_image)
                 # shape: (H, W, 3); dtype: uint8
-                image_np = np.array(pil_image)
-                H, W, _ = image_np.shape
+                # image_np = np.array(pil_image)
+                # H, W, _ = image_np.shape
 
                 pil_mask = Image.open(mask_path).convert("L")
                 # shape: (H, W), dtype: uint8
@@ -599,7 +512,7 @@ def evaluate():
                 boxes = mask_to_boxes(mask_np)
                 # boxes = mask_to_boxes(mask_np, pad_mode="box")
                 # shape: (num_contours,  num_points, 2); dtype: int
-                pos_points = mask_to_points_center(mask_np)
+                # pos_points = mask_to_points_center(mask_np)
                 # neg_points = sample_negative_points(mask_np, boxes)
 
                 '''
@@ -615,12 +528,9 @@ def evaluate():
                 plt.show()
                 '''
 
-                # pred_mask = fnet_inference(pil_image, (H, W))
-                # pred_mask = medsam_inference(pil_image, new_boxes, (H, W))
-                pred_mask = sam2_inference(image_np, boxes=boxes)
-                # pred_mask = sam2_inference(image_np, pos_points=pos_points)
-                # pred_mask = sam2_inference(image_np, boxes=boxes, pos_points=pos_points)
-                # pred_mask = sam2_inference(image_np, neg_points=neg_points, boxes=boxes)
+                pred_mask = fnet_inference(pil_image)
+                # pred_mask = sam2_inference(image_np, boxes=boxes)
+                # pred_mask = sam2_from_fnet(pil_image, boxes)
                 ''''''
                 if pred_mask.dtype != bool:
                     pred_mask = pred_mask > 0.5
@@ -642,12 +552,12 @@ def evaluate():
                     f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
                 )
 
-                fig, axs = plt.subplots(1, 2, figsize=(8, 6))
-                axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
-                axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
-                axs[0].axis('off')
-                axs[1].axis('off')
-                plt.show()
+                # fig, axs = plt.subplots(1, 2, figsize=(8, 6))
+                # axs[0].imshow(true_mask, cmap="gray", vmin=0, vmax=1)
+                # axs[1].imshow(pred_mask, cmap="gray", vmin=0, vmax=1)
+                # axs[0].axis('off')
+                # axs[1].axis('off')
+                # plt.show()
 
                 break
             break
@@ -741,7 +651,7 @@ def collect_negatives(log_file):
                 # shape: (H, W), dtype: uint8
                 mask_np = np.array(true_mask)
                 boxes = mask_to_boxes(mask_np)
-                neg_points = sample_negative_points(mask_np, boxes)
+                # neg_points = sample_negative_points(mask_np, boxes)
 
                 pil_image = Image.open(image_path).convert("RGB")
                 # Apply rotation to JPEGs with EXIF orientation
@@ -762,14 +672,14 @@ def collect_negatives(log_file):
                 for (x1, y1, x2, y2) in boxes:
                     draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
 
-                for pts in neg_points:
-                    for (x, y) in pts:
-                        # small red circle of radius 3px
-                        r = 3
-                        draw.ellipse(
-                            [(x - r, y - r), (x + r, y + r)],
-                            fill="red"
-                        )
+                # for pts in neg_points:
+                #     for (x, y) in pts:
+                #         # small red circle of radius 3px
+                #         r = 3
+                #         draw.ellipse(
+                #             [(x - r, y - r), (x + r, y + r)],
+                #             fill="red"
+                #         )
 
                 neg_dir.mkdir(parents=True, exist_ok=True)
                 pil_image.save(neg_dir / f"{name}_box.jpg")
