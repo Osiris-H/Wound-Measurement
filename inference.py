@@ -399,8 +399,8 @@ def sam2_inference(
                 tasks.append((coords, labels, np.array(box)))
 
     if not tasks:
-        logger.error("sam2_inference: must provide pos_points or boxes")
-        return None
+        H, W = image_np.shape[:2]
+        return np.zeros((H, W), dtype=bool)
 
     mask_list = []
     for point_coords, point_labels, box_coords in tasks:
@@ -425,6 +425,14 @@ def sam2_from_fnet(
         pil_image: Image.Image,
         boxes: list[tuple[int, int, int, int]]
 ) -> np.ndarray:
+    image_np = np.array(pil_image)
+    H, W = image_np.shape[:2]
+
+    # Early exit if no boxes
+    if not boxes:
+        return np.zeros((H, W), dtype=bool)
+
+
     fnet_model = load_fnet().to(device)
     fnet_model.eval()
     transform = transforms.Compose([
@@ -446,7 +454,6 @@ def sam2_from_fnet(
         low_res = torch.clamp(low_res, -32.0, 32.0)
         low_res_masks = low_res.cpu().numpy()
 
-    image_np = np.array(pil_image)
     sam2_model = load_sam2()
     predictor = SAM2ImagePredictor(sam2_model)
     predictor.set_image(image_np)
@@ -543,7 +550,9 @@ def evaluate_misc():
                 sens = compute_sens(pred_mask, true_mask)
                 spec = compute_spec(pred_mask, true_mask)
 
-                # print(f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}")
+                tqdm.write(
+                    f"Image {folder_name}-{image_name}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+                )
 
                 total_dsc += dsc
                 total_iou += iou
