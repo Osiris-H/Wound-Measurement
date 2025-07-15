@@ -197,3 +197,50 @@ def medsam_inference(pil_image, boxes, image_size):
         return pred_masks
     else:
         return combine_masks(pred_masks)
+
+
+def collect_metrics(log_prefix):
+    pat_iou = re.compile(r"^Mean\s+IoU\s*:\s*(?P<iou>\d+\.\d+)", re.MULTILINE)
+    pat_dice = re.compile(r"^Mean\s+Dice\s*:\s*(?P<dice>\d+\.\d+)", re.MULTILINE)
+    pat_sens = re.compile(r"^Mean\s+Sens\s*:\s*(?P<sens>\d+\.\d+)", re.MULTILINE)
+    pat_spec = re.compile(r"^Mean\s+Spec\s*:\s*(?P<spec>\d+\.\d+)", re.MULTILINE)
+
+    ious, dices, senss, specs = [], [], [], []
+
+    for log_path in log_dir.iterdir():
+        if not (
+                log_path.is_file()
+                and log_path.name.startswith(log_prefix)
+                and log_path.name.endswith(".log")
+        ):
+            continue
+
+        text = log_path.read_text()
+
+        # Extract summary values
+        m_iou = pat_iou.search(text)
+        m_dice = pat_dice.search(text)
+        m_sens = pat_sens.search(text)
+        m_spec = pat_spec.search(text)
+
+        if not (m_iou and m_dice and m_sens and m_spec):
+            raise ValueError(f"Could not find summary metrics in {log_path.name}")
+
+        # Convert to float and scale to percent
+        ious.append(float(m_iou.group("iou")) * 100)
+        dices.append(float(m_dice.group("dice")) * 100)
+        senss.append(float(m_sens.group("sens")) * 100)
+        specs.append(float(m_spec.group("spec")) * 100)
+
+    # print(len(ious), len(dices), len(senss), len(specs))
+
+    def mean_std(vals):
+        arr = np.array(vals, dtype=float)
+        return float(arr.mean()), float(arr.std(ddof=1))
+
+    return {
+        "IoU": mean_std(ious),
+        "Dice": mean_std(dices),
+        "Sens": mean_std(senss),
+        "Spec": mean_std(specs),
+    }

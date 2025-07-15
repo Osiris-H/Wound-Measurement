@@ -28,10 +28,8 @@ else:
 print(f"using device: {device}")
 
 data_dir = Path.cwd().parents[0] / "Data"
-test_dir = data_dir / "test"
-image_dir = test_dir / "img"
-mask_dir = test_dir / "mask"
-neg_dir = test_dir / "neg"
+misc_dir = data_dir / "MISC"
+fuseg_dir = data_dir / "FUSeg"
 log_dir = Path.cwd().parents[0] / "Results" / "eval"
 
 
@@ -473,7 +471,10 @@ def sam2_from_fnet(
     return final_mask
 
 
-def evaluate():
+def evaluate_misc():
+    image_dir = misc_dir / "img"
+    mask_dir = misc_dir / "mask"
+
     total_iou = 0.0
     total_dsc = 0.0
     total_sens = 0.0
@@ -491,6 +492,7 @@ def evaluate():
                 pbar.set_description(f"Processing {image_name} in {folder_name}")
                 mask_path = mask_subfolder / f"{image_name}.png"
                 if not mask_path.is_file():
+                    tqdm.write(f"[WARN] no label for {folder_name}-{image_name}")
                     logger.error(f"Mask not found: {mask_path}")
                     continue
 
@@ -581,54 +583,93 @@ def evaluate():
     )
 
 
-def collect_metrics(log_prefix):
-    pat_iou = re.compile(r"^Mean\s+IoU\s*:\s*(?P<iou>\d+\.\d+)", re.MULTILINE)
-    pat_dice = re.compile(r"^Mean\s+Dice\s*:\s*(?P<dice>\d+\.\d+)", re.MULTILINE)
-    pat_sens = re.compile(r"^Mean\s+Sens\s*:\s*(?P<sens>\d+\.\d+)", re.MULTILINE)
-    pat_spec = re.compile(r"^Mean\s+Spec\s*:\s*(?P<spec>\d+\.\d+)", re.MULTILINE)
+def evaluate_fuseg():
+    total_iou = 0.0
+    total_dsc = 0.0
+    total_sens = 0.0
+    total_spec = 0.0
+    total_images = 0
 
-    ious, dices, senss, specs = [], [], [], []
+    test_dir = fuseg_dir / "test"
+    image_dir = test_dir / "images"
+    label_dir = test_dir / "labels"
 
-    for log_path in log_dir.iterdir():
-        if not (
-                log_path.is_file()
-                and log_path.name.startswith(log_prefix)
-                and log_path.name.endswith(".log")
-        ):
-            continue
+    image_paths = [p for p in sorted(image_dir.iterdir()) if p.is_file()]
+    with tqdm(image_paths, unit="img") as pbar:
+        for image_path in pbar:
+            image_filename = image_path.name
+            pbar.set_description(f"Processing {image_filename}")
 
-        text = log_path.read_text()
+            label_path = label_dir / image_filename
+            if not label_path.exists():
+                tqdm.write(f"[WARN] no label for {image_filename}")
+                logger.error(f"Mask not found: {image_filename}")
+                continue
 
-        # Extract summary values
-        m_iou = pat_iou.search(text)
-        m_dice = pat_dice.search(text)
-        m_sens = pat_sens.search(text)
-        m_spec = pat_spec.search(text)
+            pil_image = Image.open(image_path).convert("RGB")
+            pil_mask = Image.open(label_path).convert("L")
+            mask_np = np.array(pil_mask)
+            true_mask = mask_np > 127
 
-        if not (m_iou and m_dice and m_sens and m_spec):
-            raise ValueError(f"Could not find summary metrics in {log_path.name}")
+            boxes = mask_to_boxes(mask_np)
 
-        # Convert to float and scale to percent
-        ious.append(float(m_iou.group("iou")) * 100)
-        dices.append(float(m_dice.group("dice")) * 100)
-        senss.append(float(m_sens.group("sens")) * 100)
-        specs.append(float(m_spec.group("spec")) * 100)
+            '''
+            # Show prompts on mask
+            mask_vis = cv2.cvtColor(mask_np, cv2.COLOR_GRAY2BGR)
+            mask_vis = cv2.cvtColor(mask_vis, cv2.COLOR_BGR2RGB)
+            fig, ax = plt.subplots(1, figsize=(8, 6))
+            ax.imshow(mask_vis)
+            show_boxes(boxes, ax)
+            plt.axis("off")
+            plt.show()
+            '''
 
-    # print(len(ious), len(dices), len(senss), len(specs))
+            pred_mask = fnet_inference(pil_image)
 
-    def mean_std(vals):
-        arr = np.array(vals, dtype=float)
-        return float(arr.mean()), float(arr.std(ddof=1))
+            total_images += 1
+            dsc = compute_dsc(pred_mask, true_mask)
+            iou = compute_iou(pred_mask, true_mask)
+            sens = compute_sens(pred_mask, true_mask)
+            spec = compute_spec(pred_mask, true_mask)
 
-    return {
-        "IoU": mean_std(ious),
-        "Dice": mean_std(dices),
-        "Sens": mean_std(senss),
-        "Spec": mean_std(specs),
-    }
+            tqdm.write(
+                f"{image_filename}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+            )
+
+            total_dsc += dsc
+            total_iou += iou
+            total_sens += sens
+            total_spec += spec
+
+            logger.info(
+                f"{image_filename}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+            )
+
+            break
+
+    mean_iou = total_iou / total_images
+    mean_dsc = total_dsc / total_images
+    mean_sens = total_sens / total_images
+    mean_spec = total_spec / total_images
+
+    print(f"Mean IoU: {mean_iou:.4f}")
+    print(f"Mean DSC: {mean_dsc:.4f}")
+    print(f"Mean Sensitivity: {mean_sens:.4f}")
+    print(f"Mean Specificity: {mean_spec:.4f}")
+
+    logger.info(
+        f"\n=== Summary over {total_images} images ===\n"
+        f"Mean IoU  : {mean_iou:.4f}\n"
+        f"Mean Dice : {mean_dsc:.4f}\n"
+        f"Mean Sens : {mean_sens:.4f}\n"
+        f"Mean Spec : {mean_spec:.4f}"
+    )
 
 
 def collect_negatives(log_file):
+    image_dir = misc_dir / "img"
+    mask_dir = misc_dir / "mask"
+    neg_dir = misc_dir / "neg"
     log_path = log_dir / log_file
 
     pattern = re.compile(r"Image\s+([^-:]+-[^-:]+):\s+IoU=([0-9]*\.?[0-9]+)")
@@ -699,7 +740,8 @@ def collect_negatives(log_file):
 if __name__ == '__main__':
     # print(os.getcwd())
     logger = setup_logger("eval.log")
-    evaluate()
+    # evaluate_misc()
+    evaluate_fuseg()
     # results = collect_metrics("medsam")
     # for name, (mu, sd) in results.items():
     #     print(f"{name:4s}: {mu:6.2f} ± {sd:5.2f} %")
