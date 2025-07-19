@@ -1,12 +1,10 @@
 import re
-from typing import Optional
-
-import PIL
 import cv2
 import numpy as np
 import torch
 import logging
 import torch.nn.functional as F
+from typing import Optional
 from matplotlib import pyplot as plt
 from torch import nn
 from tqdm import tqdm
@@ -17,7 +15,10 @@ from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from segment_anything import sam_model_registry
+from utils.common import *
+from utils.prompts import *
+from utils.evaluate import *
+
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -31,18 +32,6 @@ data_dir = Path.cwd().parents[0] / "Data"
 misc_dir = data_dir / "MISC"
 fuseg_dir = data_dir / "FUSeg"
 log_dir = Path.cwd().parents[0] / "Results" / "eval"
-
-
-def setup_logger(log_file: str) -> logging.Logger:
-    logger = logging.getLogger("Evaluation")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    fh = logging.FileHandler(log_file, mode="w")
-    fh.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s %(levelname)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-    return logger
 
 
 def load_fnet():
@@ -62,189 +51,6 @@ def load_sam2(device="cpu"):
     sam2_model = build_sam2(model_cfg, sam2_checkpoint, device=device)
 
     return sam2_model
-
-
-def compute_iou(pred_mask: np.ndarray,
-                true_mask: np.ndarray,
-                eps: float = 1e-6) -> float:
-    """
-    Compute IoU for two binary masks.
-
-    Args:
-        pred_mask (np.ndarray): Predicted mask, shape (H, W), values {0,1} or bool.
-        true_mask (np.ndarray): Ground-truth mask, same shape as pred_mask.
-        eps (float): Small constant to avoid division by zero.
-
-    Returns:
-        float: IoU score in [0,1].
-    """
-    # Ensure boolean arrays
-    pred = pred_mask.astype(bool)
-    true = true_mask.astype(bool)
-
-    # Intersection = pixels where both pred and true are 1
-    intersection = np.logical_and(pred, true).sum()
-    # Union = pixels where either pred or true is 1
-    union = np.logical_or(pred, true).sum()
-
-    return intersection / (union + eps)
-
-
-def compute_dsc(pred_mask: np.ndarray,
-                true_mask: np.ndarray,
-                eps: float = 1e-6) -> float:
-    """
-    Compute Dice Similarity Coefficient (DSC) for two binary masks.
-
-    Args:
-        pred_mask (np.ndarray): Predicted mask, shape (H, W), values {0,1} or bool.
-        true_mask (np.ndarray): Ground-truth mask, same shape as pred_mask.
-        eps (float): Small constant to avoid division by zero.
-
-    Returns:
-        float: DSC score in [0,1].
-    """
-    # Convert to boolean
-    pred = pred_mask.astype(bool)
-    true = true_mask.astype(bool)
-
-    # Count intersection and sizes
-    intersection = np.logical_and(pred, true).sum()
-    size_pred = pred.sum()
-    size_true = true.sum()
-
-    # DSC formula
-    return (2 * intersection + eps) / (size_pred + size_true + eps)
-
-
-def compute_sens(pred_mask: np.ndarray,
-                 true_mask: np.ndarray,
-                 eps: float = 1e-6) -> float:
-    """
-    Compute Sensitivity (Recall, TPR) for two binary masks.
-
-    Returns:
-        float: Sensitivity in [0,1].
-    """
-    pred = pred_mask.astype(bool)
-    true = true_mask.astype(bool)
-
-    # True Positives & False Negatives
-    tp = np.logical_and(pred, true).sum()
-    fn = np.logical_and(~pred, true).sum()
-
-    return tp / (tp + fn + eps)
-
-
-def compute_spec(pred_mask: np.ndarray,
-                 true_mask: np.ndarray,
-                 eps: float = 1e-6) -> float:
-    """
-    Compute Specificity (TNR) for two binary masks.
-
-    Returns:
-        float: Specificity in [0,1].
-    """
-    pred = pred_mask.astype(bool)
-    true = true_mask.astype(bool)
-
-    # True Negatives & False Positives
-    tn = np.logical_and(~pred, ~true).sum()
-    fp = np.logical_and(pred, ~true).sum()
-
-    return tn / (tn + fp + eps)
-
-
-def mask_to_boxes(
-        mask: np.ndarray,
-        min_area: int = 0,
-        pad_frac: float = 0.05,
-        pad_mode: Optional[str] = None
-) -> list[tuple[int, int, int, int]]:
-    """
-    Extracts bounding boxes around external contours in `mask`, then enlarges
-    each box by a padding fraction.
-
-    Args:
-      mask:      2D or 3D uint8 array (H×W), foreground >127.
-      min_area:  minimum area (in pixels) to keep a box.
-      pad_frac:  fraction by which to enlarge each box.
-      pad_mode:  "box" → pad relative to the box’s own width/height;
-                 "image" → pad relative to the full image’s width/height.
-
-    Returns:
-      List of (x1, y1, x2, y2) tuples, with padding applied and
-      clamped to image boundaries.
-    """
-    H, W = mask.shape[:2]
-    _, bw = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    boxes = []
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
-        if area < min_area:
-            continue
-
-        if pad_mode == "box":
-            pad_w = int(round(pad_frac * w))
-            pad_h = int(round(pad_frac * h))
-        elif pad_mode == "image":
-            pad_w = int(round(pad_frac * W))
-            pad_h = int(round(pad_frac * H))
-        else:
-            pad_w = pad_h = 0
-
-        x1 = max(0, x - pad_w)
-        y1 = max(0, y - pad_h)
-        x2 = min(W, x + w + pad_w)
-        y2 = min(H, y + h + pad_h)
-
-        boxes.append((x1, y1, x2, y2))
-
-    return boxes
-
-
-def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
-    """
-    Jitter a single bounding box by Gaussian noise proportional to its size.
-
-    Args:
-        box (array-like of 4 floats): [xmin, ymin, xmax, ymax] in pixel coords.
-        image_size (tuple): (width, height) of the image for clamping.
-        alpha (float): relative jitter scale (fraction of box width/height).
-        mode (str): "corner" or "center_size" jitter strategy.
-        clip (bool): whether to clamp output to [0, W]×[0, H].
-
-    Returns:
-        noisy_box (tuple of 4 floats): (xmin', ymin', xmax', ymax').
-    """
-
-    W_img, H_img = image_size
-
-    x_min, y_min, x_max, y_max = box
-    w = x_max - x_min
-    h = y_max - y_min
-
-    sigma_x = alpha * w
-    sigma_y = alpha * h
-    dx1, dy1 = np.random.normal(0, sigma_x), np.random.normal(0, sigma_y)
-    dx2, dy2 = np.random.normal(0, sigma_x), np.random.normal(0, sigma_y)
-    x_min = x_min + dx1
-    y_min = y_min + dy1
-    x_max = x_max + dx2
-    y_max = y_max + dy2
-
-    x_min, x_max = min(x_min, x_max), max(x_min, x_max)
-    y_min, y_max = min(y_min, y_max), max(y_min, y_max)
-
-    x_min = np.clip(x_min, 0, W_img)
-    x_max = np.clip(x_max, 0, W_img)
-    y_min = np.clip(y_min, 0, H_img)
-    y_max = np.clip(y_max, 0, H_img)
-
-    return x_min, y_min, x_max, y_max
 
 
 def combine_masks(masks: np.ndarray) -> np.ndarray:
@@ -633,7 +439,8 @@ def evaluate_fuseg():
             plt.show()
             '''
 
-            pred_mask = fnet_inference(pil_image)
+            # pred_mask = fnet_inference(pil_image)
+            pred_mask = sam2_inference(pil_image, boxes=boxes)
 
             total_images += 1
             dsc = compute_dsc(pred_mask, true_mask)
@@ -641,9 +448,9 @@ def evaluate_fuseg():
             sens = compute_sens(pred_mask, true_mask)
             spec = compute_spec(pred_mask, true_mask)
 
-            tqdm.write(
-                f"{image_filename}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
-            )
+            # tqdm.write(
+            #     f"{image_filename}: IoU={iou:.4f}, Dice={dsc:.4f}, Sens={sens:.4f}, Spec={spec:.4f}"
+            # )
 
             total_dsc += dsc
             total_iou += iou
@@ -675,80 +482,9 @@ def evaluate_fuseg():
     )
 
 
-def collect_negatives(log_file):
-    image_dir = misc_dir / "img"
-    mask_dir = misc_dir / "mask"
-    neg_dir = misc_dir / "neg"
-    log_path = log_dir / log_file
-
-    pattern = re.compile(r"Image\s+([^-:]+-[^-:]+):\s+IoU=([0-9]*\.?[0-9]+)")
-
-    with open(log_path, 'r') as f:
-        for line in f:
-            m = pattern.search(line)
-            if not m:
-                continue
-
-            name, iou = m.groups()
-            iou = float(iou)
-            if iou < 0.8:
-                print(name, iou)
-                folder_name, image_name = name.split("-")
-                image_path = image_dir / folder_name / f"{image_name}.jpg"
-                mask_path = mask_dir / folder_name / f"{image_name}.png"
-
-                true_mask = Image.open(mask_path).convert("L")
-                # shape: (H, W), dtype: uint8
-                mask_np = np.array(true_mask)
-                boxes = mask_to_boxes(mask_np)
-                # neg_points = sample_negative_points(mask_np, boxes)
-
-                pil_image = Image.open(image_path).convert("RGB")
-                # Apply rotation to JPEGs with EXIF orientation
-                pil_image = ImageOps.exif_transpose(pil_image)
-                # shape: (H, W, 3); dtype: uint8
-                image_np = np.array(pil_image)
-                H, W, _ = image_np.shape
-
-                fnet_mask = fnet_inference(pil_image, (H, W))
-                fnet_mask = (fnet_mask.astype(np.uint8)) * 255
-                fnet_mask = Image.fromarray(fnet_mask, mode="L")
-
-                sam2_mask = sam2_inference(image_np, boxes=boxes)
-                sam2_mask = (sam2_mask.astype(np.uint8)) * 255
-                sam2_mask = Image.fromarray(sam2_mask, mode="L")
-
-                draw = ImageDraw.Draw(pil_image)
-                for (x1, y1, x2, y2) in boxes:
-                    draw.rectangle([x1, y1, x2, y2], outline="green", width=2)
-
-                # for pts in neg_points:
-                #     for (x, y) in pts:
-                #         # small red circle of radius 3px
-                #         r = 3
-                #         draw.ellipse(
-                #             [(x - r, y - r), (x + r, y + r)],
-                #             fill="red"
-                #         )
-
-                neg_dir.mkdir(parents=True, exist_ok=True)
-                pil_image.save(neg_dir / f"{name}_box.jpg")
-                sam2_mask.save(neg_dir / f"{name}_sam2.png")
-                fnet_mask.save(neg_dir / f"{name}_fnet.png")
-                true_mask.save(neg_dir / f"{name}_true.png")
-
-                # plt.figure(figsize=(8, 6))
-                # plt.imshow(pil_image)
-                # plt.imshow(sam2_mask, cmap="gray", vmin=0, vmax=255)
-                # plt.axis('off')
-                # plt.show()
-
-                break
-
-
 if __name__ == '__main__':
     # print(os.getcwd())
-    logger = setup_logger("eval.log")
+    logger = setup_logger(log_dir / "FUSeg" / "eval.log")
     # evaluate_misc()
     evaluate_fuseg()
     # results = collect_metrics("medsam")
