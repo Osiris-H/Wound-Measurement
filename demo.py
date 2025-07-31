@@ -104,10 +104,10 @@ def show_mask_edge(
     sam2_out = overlay_mask_edge(image_np, sam2_mask)
 
     # Save overlay results
-    fnet_out_path = demo_dir / f"FUSeg-{image_name}_fnet_{ext}"
+    fnet_out_path = demo_dir / f"FUSeg-{image_name}_fnet{ext}"
     fnet_out_path.parent.mkdir(exist_ok=True)
     Image.fromarray(fnet_out).save(fnet_out_path)
-    sam2_out_path = demo_dir / f"FUSeg-{image_name}_sam2_{ext}"
+    sam2_out_path = demo_dir / f"FUSeg-{image_name}_sam2{ext}"
     sam2_out_path.parent.mkdir(exist_ok=True)
     Image.fromarray(sam2_out).save(sam2_out_path)
 
