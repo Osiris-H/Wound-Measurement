@@ -1,6 +1,7 @@
 from PIL import Image
 import numpy as np
 import cv2
+import matplotlib.pyplot as plt
 
 def overlay_mask_edge(
     pil_image: Image.Image,
@@ -50,3 +51,17 @@ def overlay_mask_edge(
     # 6) Convert back to RGB and return as PIL.Image
     overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(overlay_rgb)
+
+def plot_mask(mask: np.ndarray):
+    """
+    Plots a boolean numpy array as a black and white mask.
+
+    Args:
+        mask (np.ndarray): A 2D numpy array of boolean dtype representing the mask.
+    """
+    if mask.dtype != bool:
+        raise ValueError("Input mask must be of boolean dtype.")
+
+    plt.imshow(mask, cmap='gray')
+    plt.axis('off') # Turn off axis to show only the mask
+    plt.show()

@@ -1,2 +1,5 @@
 /ckpt/
 *.log
+__pycache__/
+/.idea/
+/examples/

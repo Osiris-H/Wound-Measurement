@@ -55,6 +55,18 @@ def mask_to_boxes(
     return boxes
 
 
+def combine_masks(masks: np.ndarray) -> np.ndarray:
+    """
+    Given a list of binary masks for the same image,
+    return their pixel-wise OR (union) as one mask.
+    """
+    assert masks.ndim == 3
+    combined = np.zeros_like(masks[0], dtype=bool)
+    for m in masks:
+        combined |= m.astype(bool)
+    return combined
+
+
 def jitter_box(box, image_size, alpha=0.01, mode="corner", clip=True):
     """
     Jitter a single bounding box by Gaussian noise proportional to its size.
